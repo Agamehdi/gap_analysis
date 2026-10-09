@@ -1209,6 +1209,31 @@ with exports_tab:
     st.subheader("CSV exports")
 
     exp_well = filtered_well.copy()
+    # Well-level BMT constraint follows the gap-table sign convention:
+    # negative values represent shortfall against RMT OE.
+    # Historical Agreed Target already incorporates the well constraint.
+    exp_well["BMT_Well_Constraint_mbd"] = exp_well["Agreed_mbd"] - exp_well["RMT_OE_mbd"]
+    # Keep missing actual BMT capacities as NaN; never infer them from Agreed.
+    if "BMT_Capacity_mbd" not in exp_well.columns:
+        exp_well["BMT_Capacity_mbd"] = np.nan
+
+    # One row per well, using its most recent date within the active filters.
+    # RMT and Agreed originate from that same record, not a mixed-date maximum.
+    latest_well_export = (
+        exp_well.sort_values(["Date", "Well_norm"])
+        .drop_duplicates(subset=["Well_norm"], keep="last")
+        .copy()
+    )
+    latest_well_export = latest_well_export[[
+        "Date", "Well", "Reservoir", "Area", "CPS", "Manifold",
+        "RMT_OE_mbd", "Agreed_mbd", "BMT_Capacity_mbd", "BMT_Well_Constraint_mbd"
+    ]].rename(columns={
+        "RMT_OE_mbd": "RMT OE (mbd)",
+        "Agreed_mbd": "Agreed Target (mbd)",
+        "BMT_Capacity_mbd": "BMT Well Capacity (mbd)",
+        "BMT_Well_Constraint_mbd": "BMT Well Constraint (mbd)",
+    }).sort_values(["CPS", "Manifold", "Well"]).reset_index(drop=True)
+
     exp_res = f_res.copy()
     exp_cps = f_cps.copy()
     exp_manifold = f_manifold.copy()
@@ -1234,6 +1259,9 @@ with exports_tab:
     # ----------------------------------------------
 
     st.download_button("Download filtered well daily CSV", exp_well.to_csv(index=False).encode("utf-8"), file_name="WI_filtered_well_daily_with_final_IIC.csv", mime="text/csv")
+    st.download_button("Download latest well-by-well RMT / Agreed / Capacity CSV",
+                       latest_well_export.to_csv(index=False).encode("utf-8"),
+                       file_name="WI_latest_well_RMT_Agreed_BMT_Capacity.csv", mime="text/csv")
     st.download_button("Download filtered reservoir daily CSV", exp_res.to_csv(index=False).encode("utf-8"), file_name="WI_filtered_reservoir_daily_with_final_IIC.csv", mime="text/csv")
     st.download_button("Download filtered CPS daily CSV", exp_cps.to_csv(index=False).encode("utf-8"), file_name="WI_filtered_cps_daily_with_final_IIC.csv", mime="text/csv")
     st.download_button("Download filtered manifold daily CSV", exp_manifold.to_csv(index=False).encode("utf-8"), file_name="WI_filtered_manifold_daily_with_final_IIC.csv", mime="text/csv")
