@@ -14,8 +14,8 @@ RATE_COLUMNS = {'rmt': 'RMT Rate [bbl/day]', 'oe': 'RMT Rate+OE [bbl/day]',
 METRICS = ['RMT_OE', 'WELL_CAPACITY', 'AGREED_TARGET', 'Maximum Manifold Capacity',
            'Manifold Injection Rate', 'Maximum CPS Capacity', 'CPS Injection Rate',
            'IIC', 'INJ_RATE @ OE', 'Well Constraint to RMT+OE Target',
-           'MF Constraint to Agreed Target', 'MF Constraint to RMT+OE Target',
-           'CPS Constraint to Agreed Target', 'CPS Constraint to RMT+OE Target']
+           'MF Capacity Shortfall to Agreed Target', 'MF Capacity Shortfall to RMT+OE Target',
+           'CPS Capacity Shortfall to Agreed Target', 'CPS Capacity Shortfall to RMT+OE Target']
 GAPS = METRICS[9:]
 QUALITY = ['Missing BMT wells', 'Unassessed RMT+OE', 'Unassessed Agreed Target']
 
@@ -246,14 +246,19 @@ def calculate(wells, facilities, date, missing='Exclude and flag', scenario='Agr
         for column in ['Maximum CPS Capacity', 'CPS Injection Rate', 'IIC', 'INJ_RATE @ OE', *GAPS[-2:]]:
             valid = group[column].dropna()
             if len(valid): table.loc[group.index, column] = valid.iloc[0]
-    # Incomplete constraint results must not appear to cover the full demand.
-    table.loc[table['Unassessed RMT+OE'] > 0, [GAPS[0], GAPS[2]]] = np.nan
-    table.loc[table['Unassessed Agreed Target'] > 0, GAPS[1]] = np.nan
+    # Direct facility-versus-demand shortfalls are independent of BMT well capacity.
+    for idx, row in table.iterrows():
+        table.at[idx, 'Maximum Manifold Capacity'] = caps.get((row.CPS, row.Manifold), np.nan) / 1000.
+        table.at[idx, 'Maximum CPS Capacity'] = caps.get((row.CPS, ''), np.nan) / 1000.
+    table[GAPS[1]] = (table.AGREED_TARGET - table['Maximum Manifold Capacity']).clip(lower=0)
+    table[GAPS[2]] = (table.RMT_OE - table['Maximum Manifold Capacity']).clip(lower=0)
+    table.loc[table['Unassessed RMT+OE'] > 0, GAPS[0]] = np.nan
     for fac, group in table.groupby('CPS'):
-        if group['Unassessed RMT+OE'].sum() > 0:
-            table.loc[group.index, GAPS[4]] = np.nan
-        if group['Unassessed Agreed Target'].sum() > 0:
-            table.loc[group.index, GAPS[3]] = np.nan
+        limit = caps.get((fac, ''), np.nan) / 1000.
+        table.loc[group.index, GAPS[3]] = max(group.AGREED_TARGET.sum() - limit, 0.) if pd.notna(limit) else (0. if group.AGREED_TARGET.sum() == 0 else np.nan)
+        table.loc[group.index, GAPS[4]] = max(group.RMT_OE.sum() - limit, 0.) if pd.notna(limit) else (0. if group.RMT_OE.sum() == 0 else np.nan)
+    for gap, demand_col in [(GAPS[1], 'AGREED_TARGET'), (GAPS[2], 'RMT_OE')]:
+        table.loc[table[demand_col].eq(0), gap] = 0.
     # CPS values repeat in the flat export for filtering; totals count each facility once.
     facility_cols = ['Maximum CPS Capacity', 'CPS Injection Rate', 'IIC', 'INJ_RATE @ OE', *GAPS[-2:]]
     total = {'CPS': 'TOTAL', 'Manifold': '', 'Wells': len(all_wells)}
@@ -262,9 +267,9 @@ def calculate(wells, facilities, date, missing='Exclude and flag', scenario='Agr
     for col in QUALITY:
         total[col] = table[col].sum()
     if total['Unassessed RMT+OE'] > 0:
-        for col in [GAPS[0], GAPS[2], GAPS[4]]: total[col] = np.nan
-    if total['Unassessed Agreed Target'] > 0:
-        for col in [GAPS[1], GAPS[3]]: total[col] = np.nan
+        total[GAPS[0]] = np.nan
+    for col in GAPS[1:]:
+        if table[col].isna().any(): total[col] = np.nan
     audit['Capacity assessment'] = 'Assessed' if missing != 'Treat as zero' else 'Missing BMT explicitly treated as zero where applicable'
     if not unresolved.empty:
         unaudited = unresolved[['Well', 'date', 'facility', 'manifold', 'rmt', 'oe', 'capacity', 'agreed', 'eff']].copy()
@@ -293,12 +298,13 @@ def forecast(wells, facilities, baseline, start, end, decline, period, **kwargs)
     avg_total['CPS'], avg_total['Manifold'] = 'TOTAL', ''
     return average, avg_total, daily, total_frame, last_audit, unknown
 
-def gap_color(value):
+def gap_color(value, positive=False):
     if not np.isfinite(value):
         return '#eeeeee'
-    if value < -20:
+    severity = value if positive else -value
+    if severity > 20:
         return '#d85b00'
-    if value < -5:
+    if severity > 5:
         return '#ffc000'
     return '#dff1ce'
 
@@ -320,11 +326,13 @@ def reference_html(table, total, title, threshold=20.):
                     span = f' rowspan="{len(group)}"'
                 else: span = ''
                 if key == 'High Gap':
-                    value = 'HIGH' if min(row[GAPS[0]], row[GAPS[2]]) <= -threshold else ''
+                    severity = max([0., -row[GAPS[0]] if pd.notna(row[GAPS[0]]) else 0.,
+                                    *[row[g] if pd.notna(row[g]) else 0. for g in GAPS[1:]]])
+                    value = 'HIGH' if severity >= threshold else ''
                 elif key == 'Manifold':
                     value = row[key].removeprefix(fac + '_')
                 else: value = row[key]
-                color = f' style="background:{gap_color(float(value))}"' if key in GAPS else ''
+                color = f' style="background:{gap_color(float(value), positive=key != GAPS[0])}"' if key in GAPS else ''
                 text = ('n.a.' if not np.isfinite(value) else f'{value:,.1f}') if isinstance(value, (float, np.floating)) else esc(value)
                 out.append(f'<td{span}{color}>' + text + '</td>')
             out.append('</tr>')
@@ -354,7 +362,8 @@ def excel_bytes(sheets):
                 if pd.api.types.is_numeric_dtype(data[label]):
                     ws.set_column(j, j, 20, fmt)
                 if label in GAPS:
-                    for low, high, fill in [(-1e12, -20.000001, '#d85b00'),(-20, -5.000001, '#ffc000'),(-5, 0, '#dff1ce')]:
+                    intervals = [(-1e12, -20.000001, '#d85b00'),(-20, -5.000001, '#ffc000'),(-5, 0, '#dff1ce')] if label == GAPS[0] else [(20.000001, 1e12, '#d85b00'),(5.000001, 20, '#ffc000'),(0, 5, '#dff1ce')]
+                    for low, high, fill in intervals:
                         ws.conditional_format(1, j, len(data), j, {'type':'cell','criteria':'between','minimum':low,'maximum':high,'format':writer.book.add_format({'bg_color':fill})})
     return buffer.getvalue()
 
@@ -364,17 +373,17 @@ def show_report(st, table, total, title, audit, unknown, extra=None):
     c1.metric('RMT+OE demand (mbd)', f'{total.RMT_OE:,.1f}')
     incomplete = total.get('Unassessed RMT+OE', 0) > 0 or total.get('Unassessed Agreed Target', 0) > 0
     c2.metric('Assessed-well injection (mbd)' if incomplete else 'Final injection (mbd)', f'{total.IIC:,.1f}')
-    gap = sum(total[g] for g in [GAPS[0], GAPS[2], GAPS[4]])
-    c3.metric('Well + MF + CPS gap to RMT+OE (mbd)', 'n.a. — missing BMT' if pd.isna(gap) else f'{gap:,.1f}')
+    gap = total[GAPS[2]]
+    c3.metric('Manifold capacity shortfall to RMT+OE (mbd)', 'n.a. — missing facility capacity' if pd.isna(gap) else f'{gap:,.1f}')
     if incomplete:
         st.warning(f"All well demand is included. BMT is unknown for {total['Missing BMT wells']:g} wells: "
                    f"{total['Unassessed RMT+OE']:,.3f} mbd RMT+OE and {total['Unassessed Agreed Target']:,.3f} mbd Agreed Target. "
-                   'Affected gaps are unavailable; injection/capacity figures cover assessed wells only, not the complete system.')
+                   'Well gaps are unavailable where BMT is missing; injection/well-capacity figures cover assessed wells only. Direct manifold/CPS shortfalls still use all demand.')
     reference, flat, well = st.tabs(['Reference-style gap table', 'Flat output table', 'Well audit'])
     markup = reference_html(table, total, title)
     with reference:
         st.markdown(markup, unsafe_allow_html=True)
-        st.caption('Negative gaps are losses. CPS totals are displayed once per facility. Rates are mbd; calculations retain full precision.')
+        st.caption('Well gap: negative capacity loss. MF/CPS shortfall: positive max(total demand − facility capacity, 0), before well constraints. These independent shortfalls overlap and must not be added to the well gap. CPS totals are counted once per facility. Units: mbd.')
     with flat:
         st.dataframe(full, use_container_width=True, hide_index=True)
     with well:
@@ -417,9 +426,9 @@ def main():
 
 For each target scenario separately: **well rate = min(target, BMT constrained capacity)**; sum by manifold, cap at manifold capacity; sum by CPS, cap at CPS capacity. Constraint reductions are allocated proportionally back to wells. Final injection applies Well Efficiency after the constraints when enabled. Facility constraints are assumed to use the same pre-efficiency rate basis as BMT capacity and RMT+OE.
 
-Well gap to RMT+OE = after-well rate − RMT+OE target. Manifold and CPS gaps are the incremental losses at their own stage, separately for Agreed and RMT+OE. `RMT_OE` is the RMT+OE export column. `IIC` and `INJ_RATE @ OE` show the selected scenario's final injection. The screenshot does not provide underlying formulas; these explicit rules reproduce its layout and constraint stages. High Gap flags losses of at least 20 mbd; colors use 5 and 20 mbd thresholds.
+Well gap to RMT+OE = after-well rate − RMT+OE target. The four manifold/CPS shortfall columns use max(total target demand − facility capacity, 0), independently of the BMT-constrained injection pipeline. CPS demand is summed across its branches. These shortfalls overlap and must not be added together or to well losses. Incremental constraint losses remain in the well audit. `RMT_OE` is the RMT+OE export column. `IIC` and `INJ_RATE @ OE` show the selected scenario's final injection. The screenshot does not provide underlying formulas; these explicit rules reproduce its layout and constraint stages. High Gap flags losses of at least 20 mbd; colors use 5 and 20 mbd thresholds.
 
-Historical dates use only well records dated on/before the selection. A latest-only CSV cannot reconstruct earlier records. Forecast holds targets, efficiency and routing fixed at the chosen baseline, declines each well's BMT capacity from forecast start, and updates facility limits through time. Blank BMT values are never silently inferred from targets. All demand remains included when BMT is missing; only capacity assessment excludes those wells. Affected gaps are unavailable and quality columns quantify unassessed demand. PM01 is mapped to the corresponding CPS SM manifold for PWRI routing.''')
+Historical dates use only well records dated on/before the selection. A latest-only CSV cannot reconstruct earlier records. Forecast holds targets, efficiency and routing fixed at the chosen baseline, declines each well's BMT capacity from forecast start, and updates facility limits through time. Blank BMT values are never silently inferred from targets. All demand remains included when BMT is missing; only capacity assessment excludes those wells. Affected well gaps are unavailable; direct facility shortfalls remain calculable when facility capacity is known. Quality columns quantify unassessed BMT demand. PM01 is mapped to the corresponding CPS SM manifold for PWRI routing.''')
     if not uploaded or not facility_file:
         st.info('Upload both CSV files to begin. Well rates must be bbl/day. Facility CAP defaults to mbd.')
         return
