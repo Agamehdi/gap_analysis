@@ -189,7 +189,8 @@ def calculate(wells, facilities, date, missing='Exclude and flag', scenario='Agr
         for key in [(fac, manifold), (fac, '')]:
             if key not in caps:
                 raise ValueError(f'Missing facility capacity effective on {pd.Timestamp(date).date()}: {key}. Add it to facility.csv.')
-    audit = d[['Well', 'date', 'facility', 'manifold', 'rmt', 'oe', 'capacity', 'agreed', 'eff']].copy()
+    d['Reservoir'] = d.get('Reservoir', pd.Series('Unspecified', index=d.index)).fillna('Unspecified')
+    audit = d[['Well', 'Reservoir', 'date', 'facility', 'manifold', 'rmt', 'oe', 'capacity', 'agreed', 'eff']].copy()
     scenario_results = {}
     for target in ['oe', 'agreed']:
         work = d.copy()
@@ -272,7 +273,9 @@ def calculate(wells, facilities, date, missing='Exclude and flag', scenario='Agr
         if table[col].isna().any(): total[col] = np.nan
     audit['Capacity assessment'] = 'Assessed' if missing != 'Treat as zero' else 'Missing BMT explicitly treated as zero where applicable'
     if not unresolved.empty:
-        unaudited = unresolved[['Well', 'date', 'facility', 'manifold', 'rmt', 'oe', 'capacity', 'agreed', 'eff']].copy()
+        unresolved = unresolved.copy()
+        unresolved['Reservoir'] = unresolved.get('Reservoir', pd.Series('Unspecified', index=unresolved.index)).fillna('Unspecified')
+        unaudited = unresolved[['Well', 'Reservoir', 'date', 'facility', 'manifold', 'rmt', 'oe', 'capacity', 'agreed', 'eff']].copy()
         unaudited['Capacity assessment'] = 'Unknown BMT — demand included; constraint result unavailable'
         audit = pd.concat([audit, unaudited], ignore_index=True)
     audit['Forecast factor'] = factor
@@ -283,7 +286,7 @@ def forecast(wells, facilities, baseline, start, end, decline, period, **kwargs)
     dates = pd.date_range(start, end, freq='D')
     if len(dates) > 3660:
         raise ValueError('Select a forecast period of 10 years or less.')
-    tables, totals, last_audit = [], [], None
+    tables, totals, reservoirs, last_audit = [], [], [], None
     for day in dates:
         table, total, last_audit, unknown = calculate(wells, facilities, day, decline=decline,
             decline_start=start, decline_period=period, baseline=baseline, **kwargs)
@@ -291,12 +294,108 @@ def forecast(wells, facilities, baseline, start, end, decline, period, **kwargs)
         tables.append(table)
         total['DATE'] = day
         totals.append(total)
+        reservoirs.append(reservoir_summary(last_audit))
     daily = pd.concat(tables, ignore_index=True)
     average = daily.groupby(['CPS', 'Manifold'], as_index=False)[['Wells', *METRICS, *QUALITY]].mean()
     total_frame = pd.DataFrame(totals)
     avg_total = total_frame[['Wells', *METRICS, *QUALITY]].mean()
     avg_total['CPS'], avg_total['Manifold'] = 'TOTAL', ''
-    return average, avg_total, daily, total_frame, last_audit, unknown
+    reservoir_average = pd.concat(reservoirs).groupby('Reservoir', as_index=False)[['RMT_OE', 'WELL_CAPACITY', 'AGREED_TARGET']].mean()
+    return average, avg_total, daily, total_frame, last_audit, unknown, reservoir_average
+
+def reservoir_summary(audit):
+    return (audit.groupby('Reservoir', dropna=False)[['oe', 'capacity', 'agreed']]
+            .sum(min_count=1).div(1000).rename(columns={'oe':'RMT_OE', 'capacity':'WELL_CAPACITY', 'agreed':'AGREED_TARGET'}).reset_index())
+
+def chart_data(table):
+    additive = ['RMT_OE', 'WELL_CAPACITY', 'AGREED_TARGET', 'Manifold Injection Rate', *GAPS[1:3]]
+    cps = table.groupby('CPS', sort=False)[additive].sum(min_count=1).reset_index()
+    # CPS capacity/injection repeat by manifold in the flat table: take once.
+    once = table.groupby('CPS', sort=False)[['Maximum CPS Capacity', 'IIC', *GAPS[-2:]]].first().reset_index()
+    return cps.merge(once, on='CPS')
+
+def chart_layout(title, horizontal=False):
+    return {'title':{'text':title, 'font':{'size':18, 'color':'#17365D'}},
+            'paper_bgcolor':'white', 'plot_bgcolor':'white', 'font':{'family':'Arial', 'size':12, 'color':'#334155'},
+            'height':370, 'margin':{'l':65, 'r':25, 't':65, 'b':75},
+            'xaxis':{'title':{'text':'mbd' if horizontal else ''}, 'gridcolor':'#E8EDF3', 'zerolinecolor':'#CBD5E1'},
+            'yaxis':{'title':{'text':'' if horizontal else 'mbd'}, 'gridcolor':'#E8EDF3', 'zerolinecolor':'#CBD5E1'},
+            'legend':{'orientation':'h', 'y':1.13, 'x':0}, 'hovermode':'closest'}
+
+def waterfall_spec(labels, values, title):
+    valid = [(str(label), float(value)) for label, value in zip(labels, values) if pd.notna(value)]
+    names, rates = zip(*valid) if valid else ([], [])
+    total = sum(rates)
+    return {'data':[{'type':'waterfall', 'orientation':'v', 'name':'Contribution',
+        'x':['Start', *names, 'Total'], 'y':[0., *rates, 0.],
+        'measure':['absolute', *['relative']*len(rates), 'total'],
+        'text':['0', *[f'{v:,.1f}' for v in rates], f'{total:,.1f}'], 'textposition':'outside',
+        'connector':{'line':{'color':'#B9C5D3', 'width':1}},
+        'increasing':{'marker':{'color':'#65DBA0'}}, 'decreasing':{'marker':{'color':'#F97565'}},
+        'totals':{'marker':{'color':'#65C9CD'}},
+        'hovertemplate':'%{x}<br>%{text} mbd<extra></extra>'}], 'layout':chart_layout(title)}
+
+def comparison_spec(data, category, capacity, injection, title):
+    colors = ['#2463EB', '#59CB9A', '#F4B83C', '#8593A8', '#64C7CD']
+    columns = ['RMT_OE', 'WELL_CAPACITY', 'AGREED_TARGET', capacity, injection]
+    labels = ['RMT+OE demand', 'Known well capacity', 'Agreed target', 'Facility capacity', 'Assessed injection']
+    traces = []
+    for col, label, color in zip(columns, labels, colors):
+        traces.append({'type':'bar', 'name':label, 'x':data[category].astype(str).tolist(),
+                       'y':[None if pd.isna(v) else float(v) for v in data[col]], 'marker':{'color':color},
+                       'hovertemplate':'%{x}<br>'+label+': %{y:,.1f} mbd<extra></extra>'})
+    layout = chart_layout(title)
+    layout.update(barmode='group', height=450)
+    return {'data':traces, 'layout':layout}
+
+def shortfall_spec(data, category, agreed_col, oe_col, title):
+    traces = []
+    for col, label, color in [(agreed_col, 'To Agreed Target', '#F5B841'), (oe_col, 'To RMT+OE', '#F27565')]:
+        traces.append({'type':'bar', 'orientation':'h', 'name':label, 'y':data[category].astype(str).tolist(),
+            'x':[None if pd.isna(v) else float(v) for v in data[col]], 'marker':{'color':color},
+            'hovertemplate':'%{y}<br>'+label+': %{x:,.1f} mbd<extra></extra>'})
+    layout = chart_layout(title, True)
+    layout.update(barmode='group', height=max(360, 40*len(data)+130))
+    return {'data':traces, 'layout':layout}
+
+def show_charts(st, table, title, audit, reservoir_average=None):
+    import plotly.io as pio
+    cps = chart_data(table)
+    reservoir = reservoir_summary(audit) if reservoir_average is None else reservoir_average
+    figures = []
+    st.caption('All rates are mbd. Waterfalls show contributions to the total. PWRI is counted separately once. Known well capacity and assessed injection are partial where BMT is missing.')
+    cps_tab, mf_tab, gap_tab = st.tabs(['CPS & reservoir waterfalls', 'Manifold detail', 'Capacity shortfalls'])
+    def draw(spec, key):
+        figures.append(spec)
+        st.plotly_chart(spec, use_container_width=True, key=title+key,
+                        config={'displaylogo':False, 'toImageButtonOptions':{'format':'png', 'scale':2}})
+    with cps_tab:
+        for metric, label in [('RMT_OE','RMT+OE Target'), ('WELL_CAPACITY','Known Well Capacity'), ('AGREED_TARGET','Agreed Target')]:
+            left, right = st.columns(2)
+            with left: draw(waterfall_spec(cps.CPS, cps[metric], label+' by CPS'), metric+'cps')
+            with right: draw(waterfall_spec(reservoir.Reservoir, reservoir[metric], label+' by Reservoir'), metric+'res')
+        draw(comparison_spec(cps, 'CPS', 'Maximum CPS Capacity', 'IIC', 'Demand, capacity and injection by CPS'), 'cpscompare')
+    with mf_tab:
+        chosen = st.selectbox('Select CPS / PWRI facility', ['All facilities', *cps.CPS.tolist()], key=title+'chartfacility')
+        subset = table.copy() if chosen == 'All facilities' else table[table.CPS.eq(chosen)].copy()
+        subset['Chart label'] = subset.Manifold.str.replace('PWRI1_', 'PWRI1 / ', regex=False).str.replace('PWRI2_', 'PWRI2 / ', regex=False)
+        metric = st.selectbox('Manifold waterfall metric', ['RMT_OE','WELL_CAPACITY','AGREED_TARGET'], key=title+'chartmetric')
+        draw(waterfall_spec(subset['Chart label'], subset[metric], metric.replace('_',' ')+' by Manifold'), 'mfwaterfall')
+        draw(comparison_spec(subset, 'Chart label', 'Maximum Manifold Capacity', 'Manifold Injection Rate', 'Demand and capacity by Manifold'), 'mfcompare')
+        st.caption('The manifold injection column is the selected scenario after manifold constraint, before CPS constraint and any additional efficiency.')
+    with gap_tab:
+        draw(shortfall_spec(cps, 'CPS', GAPS[3], GAPS[4], 'CPS capacity shortfalls'), 'cpsgap')
+        mf = table.copy()
+        draw(shortfall_spec(mf, 'Manifold', GAPS[1], GAPS[2], 'Manifold capacity shortfalls'), 'mfgap')
+        st.caption('Shortfall = max(total target demand − facility capacity, 0). CPS and manifold shortfalls overlap and must not be summed together.')
+    parts = ['<html><head><meta charset="utf-8"></head><body><h1>'+html.escape(title)+'</h1>']
+    for i, spec in enumerate(figures):
+        parts.append(pio.to_html(spec, full_html=False, include_plotlyjs=True if i == 0 else False))
+    parts.append('</body></html>')
+    st.download_button('Download interactive charts (HTML)', '\n'.join(parts).encode(),
+                       'WI_Gap_Charts.html', 'text/html', key=title+'chartshtml')
+    st.download_button('Download CPS chart data (CSV)', cps.to_csv(index=False).encode('utf-8-sig'),
+                       'WI_CPS_Chart_Data.csv', 'text/csv', key=title+'chartcsv')
 
 def gap_color(value, positive=False):
     if not np.isfinite(value):
@@ -379,7 +478,7 @@ def show_report(st, table, total, title, audit, unknown, extra=None):
         st.warning(f"All well demand is included. BMT is unknown for {total['Missing BMT wells']:g} wells: "
                    f"{total['Unassessed RMT+OE']:,.3f} mbd RMT+OE and {total['Unassessed Agreed Target']:,.3f} mbd Agreed Target. "
                    'Well gaps are unavailable where BMT is missing; injection/well-capacity figures cover assessed wells only. Direct manifold/CPS shortfalls still use all demand.')
-    reference, flat, well = st.tabs(['Reference-style gap table', 'Flat output table', 'Well audit'])
+    reference, charts, flat, well = st.tabs(['Reference-style gap table', 'Charts', 'Flat output table', 'Well audit'])
     markup = reference_html(table, total, title)
     with reference:
         st.markdown(markup, unsafe_allow_html=True)
@@ -389,6 +488,8 @@ def show_report(st, table, total, title, audit, unknown, extra=None):
     with well:
         st.dataframe(audit, use_container_width=True, hide_index=True)
         st.caption('Well audit rates are bbl/day. OE and agreed pipelines are calculated independently.')
+    with charts:
+        show_charts(st, table, title, audit, extra.get('Average reservoir mbd') if extra else None)
     if len(unknown):
         st.warning(f'{len(unknown)} wells have missing BMT capacity. Current missing-capacity policy applies to this report.')
         with st.expander('Missing BMT capacity wells'):
@@ -472,14 +573,14 @@ Historical dates use only well records dated on/before the selection. A latest-o
                     with st.spinner('Calculating daily well, manifold and CPS constraints…'):
                         result = forecast(wells, facilities, baseline, start, end, decline, 365.25 if basis.startswith('Annual') else 30.4375, **kwargs)
                     st.session_state['forecast_result'] = result
-                    st.session_state['forecast_config'] = (uploaded.getvalue(), facility_file.getvalue(), date_format, units, facility_date_format, route, missing, scenario, efficiency)
+                    st.session_state['forecast_config'] = ("charts-v1", uploaded.getvalue(), facility_file.getvalue(), date_format, units, facility_date_format, route, missing, scenario, efficiency)
                     st.session_state['forecast_title'] = f'Average gap analysis {start} to {end} ({decline:g}% {basis.lower()})'
-            config = (uploaded.getvalue(), facility_file.getvalue(), date_format, units, facility_date_format, route, missing, scenario, efficiency)
+            config = ("charts-v1", uploaded.getvalue(), facility_file.getvalue(), date_format, units, facility_date_format, route, missing, scenario, efficiency)
             if st.session_state.get('forecast_config') == config:
-                avg, total, daily, trend, audit, unknown = st.session_state['forecast_result']
+                avg, total, daily, trend, audit, unknown, reservoir_average = st.session_state['forecast_result']
                 st.line_chart(trend.set_index('DATE')[['RMT_OE', 'WELL_CAPACITY', 'AGREED_TARGET', 'IIC']])
                 st.caption('Trend units: mbd. Targets remain fixed; declining well capacity and changing facility limits drive the forecast.')
-                show_report(st, avg, total, st.session_state['forecast_title'], audit, unknown, {'Daily manifold mbd': daily, 'Daily system mbd': trend})
+                show_report(st, avg, total, st.session_state['forecast_title'], audit, unknown, {'Daily manifold mbd': daily, 'Daily system mbd': trend, 'Average reservoir mbd': reservoir_average})
                 st.caption('The well audit shows the forecast end date. Average gap tables are means of daily constrained results, not constraints applied to mean capacities.')
             elif 'forecast_result' in st.session_state:
                 st.info('Inputs changed. Run the forecast again to refresh the results.')
