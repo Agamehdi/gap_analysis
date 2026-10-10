@@ -59,7 +59,7 @@ def normal_manifold(value):
     suffix = 'SM' if kind in ('SM', 'PM') else 'FM' + number.zfill(2)
     return (cps + '_' if cps != 'UNASSIGNED' else '') + suffix
 
-def prepare_wells(raw, dayfirst=False, route='SW'):
+def prepare_wells(raw, dayfirst=False, route='PWRI priority'):
     d = raw.copy()
     d.columns = d.columns.str.strip()
     required = ['Well', 'CPS', 'Record Date', 'SW Manifold', *RATE_COLUMNS.values()]
@@ -86,7 +86,15 @@ def prepare_wells(raw, dayfirst=False, route='SW'):
             value = row.get('PWRI Manifold', '')
             if pd.notna(value) and str(value).strip():
                 cps = normal_cps(value)
-                prefix = 'PWRI2' if cps == 'CPS7' else 'PWRI1'
+                explicit = re.search(r'PWRI\s*[-_]?\s*(\d+)', str(value), flags=re.I)
+                if explicit:
+                    prefix = 'PWRI' + explicit.group(1)
+                elif cps in ('CPS1', 'CPS4', 'CPS5'):
+                    prefix = 'PWRI1'
+                elif cps == 'CPS7':
+                    prefix = 'PWRI2'
+                else:
+                    raise ValueError(f'PWRI routing is not defined for {value}. Use an explicit PWRI1/PWRI2 prefix.')
                 d.at[i, 'facility'] = prefix
                 d.at[i, 'manifold'] = prefix + '_' + normal_manifold(value)
     efficiency = pd.to_numeric(d.get('Well Efficiency', pd.Series(100., index=d.index)), errors='coerce') / 100
@@ -397,7 +405,10 @@ def main():
         units = st.selectbox('Facility CAP units', ['mbd', 'bbl/day'])
         facility_date_format = st.selectbox('Facility date format (non-ISO)', ['Month/day/year', 'Day/month/year'])
         missing = st.selectbox('Missing BMT capacity', ['Exclude and flag', 'Treat as zero', 'Stop analysis'])
-        route = st.selectbox('Water routing', ['SW', 'PWRI priority'], help='PWRI priority assigns wells with PWRI Manifold to PWRI1 (CPS1/4/5) or PWRI2 (CPS7), once only. Add those facility constraints.')
+        route_label = st.selectbox('Water routing', ['Separate PWRI facilities (default)', 'SW only'],
+            help='Separate PWRI assigns wells with PWRI Manifold to PWRI1 (CPS1/4/5) or PWRI2 (CPS7), once only. Their demand is removed from the corresponding SW group. PWRI uses its own facility limits.')
+        route = 'PWRI priority' if route_label.startswith('Separate') else 'SW'
+        st.caption('PWRI1 is shown separately with CPS1_SM, CPS4_SM and CPS5_SM branches when present in the well CSV.')
         scenario = st.selectbox('Displayed injection scenario', ['Agreed Target', 'RMT+OE'])
         efficiency = st.checkbox('Apply additional Well Efficiency to final injection', value=False,
             help='Leave off if Agreed Target already includes operational efficiency, to avoid applying it twice.')
