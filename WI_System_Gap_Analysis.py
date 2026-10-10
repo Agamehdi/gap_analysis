@@ -17,6 +17,7 @@ METRICS = ['RMT_OE', 'WELL_CAPACITY', 'AGREED_TARGET', 'Maximum Manifold Capacit
            'MF Constraint to Agreed Target', 'MF Constraint to RMT+OE Target',
            'CPS Constraint to Agreed Target', 'CPS Constraint to RMT+OE Target']
 GAPS = METRICS[9:]
+QUALITY = ['Missing BMT wells', 'Unassessed RMT+OE', 'Unassessed Agreed Target']
 
 def read_csv(source):
     if hasattr(source, 'getvalue'):
@@ -168,6 +169,8 @@ def calculate(wells, facilities, date, missing='Exclude and flag', scenario='Agr
               baseline=None):
     # Forecast freezes the well snapshot at baseline; capacity schedules remain time-dependent.
     d, unknown = latest_wells(wells, baseline if baseline is not None else date, missing)
+    snapshot_date = baseline if baseline is not None else date
+    all_wells = wells[wells['date'] <= pd.Timestamp(snapshot_date)].sort_values('date').drop_duplicates('Well', keep='last').copy()
     if d.empty:
         raise ValueError('No usable well records on or before the selected date.')
     days = max(0., (pd.Timestamp(date) - pd.Timestamp(decline_start or date)).days)
@@ -216,11 +219,49 @@ def calculate(wells, facilities, date, missing='Exclude and flag', scenario='Agr
         row.update(dict(zip(METRICS, np.array(values) / 1000.)))
         rows.append(row)
     table = pd.DataFrame(rows).sort_values(['CPS', 'Manifold']).reset_index(drop=True)
+    # Demand always covers the full dated snapshot, independently of BMT availability.
+    demand = all_wells.groupby(['facility', 'manifold']).agg(
+        RMT_OE=('oe', 'sum'), AGREED_TARGET=('agreed', 'sum'), Wells=('Well', 'size')).reset_index()
+    demand = demand.rename(columns={'facility': 'CPS', 'manifold': 'Manifold'})
+    demand[['RMT_OE', 'AGREED_TARGET']] /= 1000.
+    table = demand.merge(table.drop(columns=['RMT_OE', 'AGREED_TARGET', 'Wells']),
+                         on=['CPS', 'Manifold'], how='left')
+    unresolved = unknown if missing == 'Exclude and flag' else unknown.iloc[:0]
+    quality = unresolved.groupby(['facility', 'manifold']).agg(
+        **{'Missing BMT wells': ('Well', 'size'), 'Unassessed RMT+OE': ('oe', 'sum'),
+           'Unassessed Agreed Target': ('agreed', 'sum')}).reset_index()
+    quality = quality.rename(columns={'facility':'CPS', 'manifold':'Manifold'})
+    quality[['Unassessed RMT+OE', 'Unassessed Agreed Target']] /= 1000.
+    table = table.merge(quality, on=['CPS', 'Manifold'], how='left')
+    table[QUALITY] = table[QUALITY].fillna(0)
+    for fac, group in table.groupby('CPS'):
+        for column in ['Maximum CPS Capacity', 'CPS Injection Rate', 'IIC', 'INJ_RATE @ OE', *GAPS[-2:]]:
+            valid = group[column].dropna()
+            if len(valid): table.loc[group.index, column] = valid.iloc[0]
+    # Incomplete constraint results must not appear to cover the full demand.
+    table.loc[table['Unassessed RMT+OE'] > 0, [GAPS[0], GAPS[2]]] = np.nan
+    table.loc[table['Unassessed Agreed Target'] > 0, GAPS[1]] = np.nan
+    for fac, group in table.groupby('CPS'):
+        if group['Unassessed RMT+OE'].sum() > 0:
+            table.loc[group.index, GAPS[4]] = np.nan
+        if group['Unassessed Agreed Target'].sum() > 0:
+            table.loc[group.index, GAPS[3]] = np.nan
     # CPS values repeat in the flat export for filtering; totals count each facility once.
     facility_cols = ['Maximum CPS Capacity', 'CPS Injection Rate', 'IIC', 'INJ_RATE @ OE', *GAPS[-2:]]
-    total = {'CPS': 'TOTAL', 'Manifold': '', 'Wells': len(d)}
+    total = {'CPS': 'TOTAL', 'Manifold': '', 'Wells': len(all_wells)}
     for col in METRICS:
         total[col] = table.drop_duplicates('CPS')[col].sum() if col in facility_cols else table[col].sum()
+    for col in QUALITY:
+        total[col] = table[col].sum()
+    if total['Unassessed RMT+OE'] > 0:
+        for col in [GAPS[0], GAPS[2], GAPS[4]]: total[col] = np.nan
+    if total['Unassessed Agreed Target'] > 0:
+        for col in [GAPS[1], GAPS[3]]: total[col] = np.nan
+    audit['Capacity assessment'] = 'Assessed' if missing != 'Treat as zero' else 'Missing BMT explicitly treated as zero where applicable'
+    if not unresolved.empty:
+        unaudited = unresolved[['Well', 'date', 'facility', 'manifold', 'rmt', 'oe', 'capacity', 'agreed', 'eff']].copy()
+        unaudited['Capacity assessment'] = 'Unknown BMT — demand included; constraint result unavailable'
+        audit = pd.concat([audit, unaudited], ignore_index=True)
     audit['Forecast factor'] = factor
     audit['Analysis date'] = pd.Timestamp(date)
     return table, pd.Series(total), audit, unknown
@@ -238,9 +279,9 @@ def forecast(wells, facilities, baseline, start, end, decline, period, **kwargs)
         total['DATE'] = day
         totals.append(total)
     daily = pd.concat(tables, ignore_index=True)
-    average = daily.groupby(['CPS', 'Manifold'], as_index=False)[['Wells', *METRICS]].mean()
+    average = daily.groupby(['CPS', 'Manifold'], as_index=False)[['Wells', *METRICS, *QUALITY]].mean()
     total_frame = pd.DataFrame(totals)
-    avg_total = total_frame[['Wells', *METRICS]].mean()
+    avg_total = total_frame[['Wells', *METRICS, *QUALITY]].mean()
     avg_total['CPS'], avg_total['Manifold'] = 'TOTAL', ''
     return average, avg_total, daily, total_frame, last_audit, unknown
 
@@ -276,13 +317,13 @@ def reference_html(table, total, title, threshold=20.):
                     value = row[key].removeprefix(fac + '_')
                 else: value = row[key]
                 color = f' style="background:{gap_color(float(value))}"' if key in GAPS else ''
-                text = f'{value:,.1f}' if isinstance(value, (float, np.floating)) else esc(value)
+                text = ('n.a.' if not np.isfinite(value) else f'{value:,.1f}') if isinstance(value, (float, np.floating)) else esc(value)
                 out.append(f'<td{span}{color}>' + text + '</td>')
             out.append('</tr>')
     out.append('<tr class="total">')
     for key, _ in headers:
         value = total.get(key, '')
-        text = f'{value:,.1f}' if isinstance(value, (float, np.floating)) else esc(value)
+        text = ('n.a.' if not np.isfinite(value) else f'{value:,.1f}') if isinstance(value, (float, np.floating)) else esc(value)
         out.append('<td>' + text + '</td>')
     out.append('</tr></tbody></table></div>')
     return ''.join(out)
@@ -313,8 +354,14 @@ def show_report(st, table, total, title, audit, unknown, extra=None):
     full = pd.concat([table, total.to_frame().T], ignore_index=True)
     c1, c2, c3 = st.columns(3)
     c1.metric('RMT+OE demand (mbd)', f'{total.RMT_OE:,.1f}')
-    c2.metric('Final injection (mbd)', f'{total.IIC:,.1f}')
-    c3.metric('Well + MF + CPS gap to RMT+OE (mbd)', f'{sum(total[g] for g in [GAPS[0], GAPS[2], GAPS[4]]):,.1f}')
+    incomplete = total.get('Unassessed RMT+OE', 0) > 0 or total.get('Unassessed Agreed Target', 0) > 0
+    c2.metric('Assessed-well injection (mbd)' if incomplete else 'Final injection (mbd)', f'{total.IIC:,.1f}')
+    gap = sum(total[g] for g in [GAPS[0], GAPS[2], GAPS[4]])
+    c3.metric('Well + MF + CPS gap to RMT+OE (mbd)', 'n.a. — missing BMT' if pd.isna(gap) else f'{gap:,.1f}')
+    if incomplete:
+        st.warning(f"All well demand is included. BMT is unknown for {total['Missing BMT wells']:g} wells: "
+                   f"{total['Unassessed RMT+OE']:,.3f} mbd RMT+OE and {total['Unassessed Agreed Target']:,.3f} mbd Agreed Target. "
+                   'Affected gaps are unavailable; injection/capacity figures cover assessed wells only, not the complete system.')
     reference, flat, well = st.tabs(['Reference-style gap table', 'Flat output table', 'Well audit'])
     markup = reference_html(table, total, title)
     with reference:
@@ -361,7 +408,7 @@ For each target scenario separately: **well rate = min(target, BMT constrained c
 
 Well gap to RMT+OE = after-well rate − RMT+OE target. Manifold and CPS gaps are the incremental losses at their own stage, separately for Agreed and RMT+OE. `RMT_OE` is the RMT+OE export column. `IIC` and `INJ_RATE @ OE` show the selected scenario's final injection. The screenshot does not provide underlying formulas; these explicit rules reproduce its layout and constraint stages. High Gap flags losses of at least 20 mbd; colors use 5 and 20 mbd thresholds.
 
-Historical dates use only well records dated on/before the selection. A latest-only CSV cannot reconstruct earlier records. Forecast holds targets, efficiency and routing fixed at the chosen baseline, declines each well's BMT capacity from forecast start, and updates facility limits through time. Blank BMT values are never silently inferred from targets. PM01 is mapped to the corresponding CPS SM manifold for PWRI routing.''')
+Historical dates use only well records dated on/before the selection. A latest-only CSV cannot reconstruct earlier records. Forecast holds targets, efficiency and routing fixed at the chosen baseline, declines each well's BMT capacity from forecast start, and updates facility limits through time. Blank BMT values are never silently inferred from targets. All demand remains included when BMT is missing; only capacity assessment excludes those wells. Affected gaps are unavailable and quality columns quantify unassessed demand. PM01 is mapped to the corresponding CPS SM manifold for PWRI routing.''')
     if not uploaded or not facility_file:
         st.info('Upload both CSV files to begin. Well rates must be bbl/day. Facility CAP defaults to mbd.')
         return
@@ -377,7 +424,7 @@ Historical dates use only well records dated on/before the selection. A latest-o
         with snapshot_tab:
             selected = st.date_input('Analysis date', last, min_value=first, max_value=last+timedelta(days=3650))
             t, total, audit, unknown = calculate(wells, facilities, selected, **kwargs)
-            omitted = wells.Well.nunique()-audit.Well.nunique()-len(unknown)
+            omitted = wells.Well.nunique()-audit.Well.nunique()
             if omitted: st.warning(f'{omitted} wells have no record on/before this date and are absent.')
             show_report(st, t, total, f'Gap analysis {selected}', audit, unknown)
             if st.checkbox('Compare with another date'):
